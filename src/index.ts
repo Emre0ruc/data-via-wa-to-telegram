@@ -39,7 +39,7 @@ async function main(): Promise<void> {
     onMessagesUpsert: (event, sock) => {
       // Anything that is not a live self-chat message is dropped here, unlogged.
       for (const msg of selfChatMessages(event, sock.user)) {
-        queue.push(normalize(msg, { mediaDir, logger }));
+        queue.push(normalize(msg, { mediaDir, privatePrefix: config.privatePrefix, logger }));
       }
     },
   });

@@ -20,6 +20,23 @@ export function isSelfChatMessage(msg: WAMessage, own: Set<string>): boolean {
   });
 }
 
+// Case-insensitive the Turkish way: GİZLİ and gizli match, and dotless ı is folded to i so
+// GIZLI (typed on an English keyboard) matches too. NFC so composed/decomposed letters agree.
+function fold(s: string): string {
+  return s.normalize('NFC').toLocaleLowerCase('tr').replace(/ı/g, 'i');
+}
+
+// Whitespace plus invisible characters that sneak in with copy-paste (zero-width, BOM).
+const LEADING_BLANKS = /^[\s\u200B-\u200D\u2060\uFEFF]+/;
+
+// True if the text (a message or a media caption) starts with the private prefix. Errs on
+// the side of not relaying: leading blanks are ignored and "#gizlilik" counts as private too.
+export function isPrivate(text: string | undefined, prefix: string): boolean {
+  if (!text) return false;
+  const p = fold(prefix.trim());
+  return p !== '' && fold(text.replace(LEADING_BLANKS, '')).startsWith(p);
+}
+
 // Only live messages ('notify'). 'append' covers history and messages queued while offline.
 export function selfChatMessages(
   event: BaileysEventMap['messages.upsert'],

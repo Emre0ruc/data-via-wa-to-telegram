@@ -3,10 +3,12 @@ import path from 'node:path';
 import { getContentType, normalizeMessageContent, toNumber, type WAMessage } from 'baileys';
 import { MAX_MEDIA_BYTES, type RelayMessage, type RelayMessageType } from '../core/types.js';
 import type { Logger } from '../logger.js';
+import { isPrivate } from './filter.js';
 import { downloadMedia, mediaFileName, type DownloadMedia } from './media.js';
 
 export type NormalizeOptions = {
   mediaDir: string;
+  privatePrefix: string;
   logger: Logger;
   download?: DownloadMedia; // injectable for tests
 };
@@ -52,18 +54,27 @@ export async function normalize(
   msg: WAMessage,
   options: NormalizeOptions,
 ): Promise<RelayMessage | undefined> {
-  const { mediaDir, logger, download = downloadMedia } = options;
+  const { mediaDir, privatePrefix, logger, download = downloadMedia } = options;
   const log = logger.child({ module: 'whatsapp' });
 
   const id = msg.key.id;
   if (!id) return undefined;
+
+  // Telegram bot chats are not end-to-end encrypted, so private messages never leave.
+  const dropPrivate = (type: string): undefined => {
+    log.info({ id, type }, 'private message not relayed');
+    return undefined;
+  };
 
   // WhatsApp sends seconds, sometimes as a protobuf Long; toNumber handles both (0 if missing).
   const seconds = toNumber(msg.messageTimestamp);
   const timestamp = seconds > 0 ? seconds * 1000 : Date.now();
 
   const text = extractText(msg);
-  if (text !== undefined) return { id, timestamp, type: 'text', text };
+  if (text !== undefined) {
+    if (isPrivate(text, privatePrefix)) return dropPrivate(messageType(msg));
+    return { id, timestamp, type: 'text', text };
+  }
 
   const content = normalizeMessageContent(msg.message);
   let info: MediaInfo | undefined;
@@ -95,6 +106,9 @@ export async function normalize(
   }
 
   const { caption, fileName, mimeType } = info;
+  // Checked before anything else, so a private file is never even downloaded.
+  if (isPrivate(caption, privatePrefix)) return dropPrivate(info.waType);
+
   const tooLarge = (bytes: number): RelayMessage => ({
     id,
     timestamp,
