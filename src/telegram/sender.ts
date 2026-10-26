@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { Api, GrammyError, HttpError, InputFile } from 'grammy';
+import QRCode from 'qrcode';
 import type { RetryDecision } from '../core/queue.js';
 import type { RelayMessage } from '../core/types.js';
 import type { Logger } from '../logger.js';
@@ -17,7 +18,18 @@ export type TelegramSenderOptions = {
 
 export type TelegramSender = {
   send(msg: RelayMessage): Promise<void>;
+  // Plain status message (alerts). Throws TelegramError.
+  notify(text: string): Promise<void>;
+  // Pairing: shows the QR as one photo that is replaced on every refresh. Never throws.
+  showQr(qr: string): Promise<void>;
+  // Pairing done: removes the QR photo and confirms. No-op if no QR was shown. Never throws.
+  linked(): Promise<void>;
 };
+
+const QR_CAPTION =
+  'Link WhatsApp: on your phone open WhatsApp > Linked devices > Link a device and scan this. '
+  + 'It refreshes by itself until it is scanned.';
+const LINKED_TEXT = '✅ WhatsApp linked. Your self-chat messages will show up here.';
 
 // grammY errors are unsafe to log as-is: GrammyError.payload holds the message text, and
 // HttpError.error is the raw fetch error whose message contains the request URL (with the
@@ -145,7 +157,52 @@ export async function createTelegramSender(options: TelegramSenderOptions): Prom
       await api.sendDocument(chatId, inputFile(media), other);
     });
 
+  // The pairing QR is a single message: edited when WhatsApp rotates the code (~every 20 s),
+  // deleted once linked. Steps run one after another so two refreshes can't both send a photo.
+  let qrMessageId: number | undefined;
+  let qrSteps: Promise<void> = Promise.resolve();
+  const qrStep = (what: string, step: () => Promise<void>): Promise<void> => {
+    qrSteps = qrSteps.then(step).catch((err: unknown) => log.warn({ err: toSafeError(err) }, `${what} failed`));
+    return qrSteps;
+  };
+
   return {
+    async notify(text) {
+      try {
+        await sendText(text);
+      } catch (err) {
+        throw toSafeError(err);
+      }
+    },
+
+    showQr(qr) {
+      return qrStep('showing pairing QR', async () => {
+        const png = await QRCode.toBuffer(qr, { width: 512, margin: 2 });
+        const photo = () => new InputFile(png, 'whatsapp-qr.png');
+        if (qrMessageId !== undefined) {
+          try {
+            await api.editMessageMedia(chatId, qrMessageId, { type: 'photo', media: photo(), caption: QR_CAPTION });
+            return;
+          } catch (err) {
+            // E.g. the QR message was deleted in the chat: send a fresh one below.
+            log.warn({ err: toSafeError(err) }, 'could not replace pairing QR, sending a new one');
+          }
+        }
+        qrMessageId = (await api.sendPhoto(chatId, photo(), { caption: QR_CAPTION })).message_id;
+      });
+    },
+
+    linked() {
+      return qrStep('pairing cleanup', async () => {
+        if (qrMessageId === undefined) return;
+        const id = qrMessageId;
+        qrMessageId = undefined;
+        // A used QR has no reason to stay in the chat. Already deleted by hand is fine.
+        await api.deleteMessage(chatId, id).catch(() => {});
+        await api.sendMessage(chatId, LINKED_TEXT);
+      });
+    },
+
     async send(msg) {
       try {
         if (msg.type === 'text' && msg.text) return await sendText(msg.text);

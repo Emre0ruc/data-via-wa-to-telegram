@@ -14,10 +14,16 @@ export type MessagesUpsertHandler = (
   sock: WASocket,
 ) => void;
 
+export type FatalReason = 'loggedOut' | 'connectionReplaced';
+
 export type WhatsAppOptions = {
   sessionDir: string;
   logger: Logger;
   onMessagesUpsert?: MessagesUpsertHandler;
+  // Lifecycle hooks (e.g. to show the QR in Telegram). They must not throw.
+  onQr?: (qr: string) => void;
+  onOpen?: () => void;
+  onFatal?: (reason: FatalReason) => void;
 };
 
 export type WhatsAppConnection = {
@@ -59,7 +65,7 @@ async function printQr(qr: string): Promise<void> {
 }
 
 export async function startWhatsApp(options: WhatsAppOptions): Promise<WhatsAppConnection> {
-  const { sessionDir, logger, onMessagesUpsert } = options;
+  const { sessionDir, logger, onMessagesUpsert, onQr, onOpen, onFatal } = options;
   const log = logger.child({ module: 'whatsapp' });
   const baileysLogger = createBaileysLogger(logger);
 
@@ -91,13 +97,18 @@ export async function startWhatsApp(options: WhatsAppOptions): Promise<WhatsAppC
 
     s.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
       if (qr) {
-        log.info('scan the QR code below with WhatsApp > Linked devices > Link a device');
-        printQr(qr).catch((err: unknown) => log.error({ err }, 'failed to render QR code'));
+        log.info('new pairing QR code: scan it with WhatsApp > Linked devices > Link a device');
+        // Only in a real terminal; under Docker the logs would just fill up with QR blocks.
+        if (process.stdout.isTTY) {
+          printQr(qr).catch((err: unknown) => log.error({ err }, 'failed to render QR code'));
+        }
+        onQr?.(qr);
       }
 
       if (connection === 'open') {
         openedAt = Date.now();
         log.info('connected to WhatsApp');
+        onOpen?.();
         return;
       }
       if (connection !== 'close' || stopped) return;
@@ -108,12 +119,14 @@ export async function startWhatsApp(options: WhatsAppOptions): Promise<WhatsAppC
       const code = disconnectStatusCode(lastDisconnect?.error);
       const delayMs = reconnectDelay(code, attempt);
       if (delayMs === undefined) {
+        const reason: FatalReason = code === DisconnectReason.loggedOut ? 'loggedOut' : 'connectionReplaced';
         log.error(
           { code },
-          code === DisconnectReason.loggedOut
+          reason === 'loggedOut'
             ? 'session logged out; delete the session folder and restart to pair again'
             : 'session opened elsewhere (another instance running?); not reconnecting',
         );
+        onFatal?.(reason);
         return;
       }
 

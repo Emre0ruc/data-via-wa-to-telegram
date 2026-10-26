@@ -4,13 +4,23 @@ import { ConfigError, loadConfig } from './config.js';
 import { createQueue } from './core/queue.js';
 import { createLogger } from './logger.js';
 import { createTelegramSender, retryDecision, TelegramError } from './telegram/sender.js';
-import { startWhatsApp } from './whatsapp/connection.js';
+import { startWhatsApp, type FatalReason } from './whatsapp/connection.js';
 import { selfChatMessages } from './whatsapp/filter.js';
 import { prepareMediaDir } from './whatsapp/media.js';
 import { normalize } from './whatsapp/normalize.js';
 
 // How long shutdown waits for queued messages to reach Telegram.
 const SHUTDOWN_TIMEOUT_MS = 10_000;
+
+// Sent to Telegram when WhatsApp ends the session for good (the app stops reconnecting).
+const FATAL_NOTICES: Record<FatalReason, string> = {
+  loggedOut:
+    '⚠️ WhatsApp logged this device out, so nothing is being relayed. To link again: stop the app, '
+    + 'delete the data/session folder, start it again and scan the new QR code that appears here.',
+  connectionReplaced:
+    '⚠️ Another copy of the app opened this WhatsApp session, so this one stopped. '
+    + 'Make sure only one copy is running, then restart it.',
+};
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -36,6 +46,14 @@ async function main(): Promise<void> {
   const whatsapp = await startWhatsApp({
     sessionDir: path.join(config.dataDir, 'session'),
     logger,
+    // Pairing happens from Telegram: the QR shows up in the bot chat, no terminal needed.
+    onQr: (qr) => void telegram.showQr(qr),
+    onOpen: () => void telegram.linked(),
+    onFatal: (reason) => {
+      telegram
+        .notify(FATAL_NOTICES[reason])
+        .catch((err: unknown) => logger.error({ err, reason }, 'could not send the alert to Telegram'));
+    },
     onMessagesUpsert: (event, sock) => {
       // Anything that is not a live self-chat message is dropped here, unlogged.
       for (const msg of selfChatMessages(event, sock.user)) {
