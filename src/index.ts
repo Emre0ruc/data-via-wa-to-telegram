@@ -1,3 +1,4 @@
+import { rm } from 'node:fs/promises';
 import path from 'node:path';
 import { ConfigError, loadConfig } from './config.js';
 import { createQueue } from './core/queue.js';
@@ -5,7 +6,8 @@ import { createLogger } from './logger.js';
 import { createTelegramSender, TelegramError } from './telegram/sender.js';
 import { startWhatsApp } from './whatsapp/connection.js';
 import { selfChatMessages } from './whatsapp/filter.js';
-import { messageType, normalize } from './whatsapp/normalize.js';
+import { prepareMediaDir } from './whatsapp/media.js';
+import { normalize } from './whatsapp/normalize.js';
 
 // How long shutdown waits for queued messages to reach Telegram.
 const SHUTDOWN_TIMEOUT_MS = 10_000;
@@ -20,7 +22,17 @@ async function main(): Promise<void> {
     chatId: config.telegramChatId,
     logger,
   });
-  const queue = createQueue((msg) => telegram.send(msg), logger);
+  const mediaDir = path.join(config.dataDir, 'media');
+  await prepareMediaDir(mediaDir);
+
+  const queue = createQueue(async (msg) => {
+    try {
+      await telegram.send(msg);
+    } finally {
+      // Temporary files go away whether or not the send worked (no retries before phase 4).
+      if (msg.media) await rm(msg.media.path, { force: true });
+    }
+  }, logger);
 
   const whatsapp = await startWhatsApp({
     sessionDir: path.join(config.dataDir, 'session'),
@@ -28,12 +40,7 @@ async function main(): Promise<void> {
     onMessagesUpsert: (event, sock) => {
       // Anything that is not a live self-chat message is dropped here, unlogged.
       for (const msg of selfChatMessages(event, sock.user)) {
-        const relay = normalize(msg);
-        if (relay) {
-          queue.push(relay);
-        } else {
-          logger.info({ id: msg.key.id, type: messageType(msg) }, 'self-chat message not relayed (unsupported type)');
-        }
+        queue.push(normalize(msg, { mediaDir, logger }));
       }
     },
   });

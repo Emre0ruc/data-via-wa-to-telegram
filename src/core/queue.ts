@@ -4,8 +4,12 @@ import type { RelayMessage } from './types.js';
 // The queue does not know where messages go; index.ts plugs in the Telegram sender.
 export type Deliver = (msg: RelayMessage) => Promise<void>;
 
+// A message, or one still being prepared (e.g. media downloading). undefined = nothing to send.
+export type QueueItem = RelayMessage | Promise<RelayMessage | undefined>;
+
 export type RelayQueue = {
-  push(msg: RelayMessage): void;
+  // Preparation runs in parallel, delivery stays in push order.
+  push(item: QueueItem): void;
   // Stops accepting messages and waits up to timeoutMs for the pending ones.
   close(timeoutMs: number): Promise<void>;
 };
@@ -19,26 +23,33 @@ export function createQueue(deliver: Deliver, logger: Logger): RelayQueue {
   let pending = 0;
   let closed = false;
 
-  const deliverOne = async (msg: RelayMessage): Promise<void> => {
+  const deliverOne = async (item: Promise<RelayMessage | undefined>): Promise<void> => {
+    let msg: RelayMessage | undefined;
     try {
+      msg = await item;
+      if (!msg) return;
       await deliver(msg);
       log.info({ id: msg.id, type: msg.type }, 'relayed');
     } catch (err) {
       // deliver() must throw log-safe errors (see TelegramError): no message text, no token.
-      log.error({ id: msg.id, type: msg.type, err }, 'relay failed, message dropped');
+      log.error({ id: msg?.id, type: msg?.type, err }, 'relay failed, message dropped');
     } finally {
       pending--;
     }
   };
 
   return {
-    push(msg) {
+    push(item) {
       if (closed) {
-        log.warn({ id: msg.id }, 'queue closed, message dropped');
+        log.warn({ id: 'id' in item ? item.id : undefined }, 'queue closed, message dropped');
         return;
       }
+      const ready = Promise.resolve(item);
+      // Mark a rejection as handled now; deliverOne reports it when its turn comes.
+      // Without this, a failure while earlier messages are still sending crashes Node.
+      ready.catch(() => {});
       pending++;
-      tail = tail.then(() => deliverOne(msg));
+      tail = tail.then(() => deliverOne(ready));
     },
 
     async close(timeoutMs) {
