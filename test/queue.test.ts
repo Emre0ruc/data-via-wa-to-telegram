@@ -96,6 +96,109 @@ describe('queue: failures', () => {
   });
 });
 
+describe('queue: retries', () => {
+  const fast = { initialMs: 5, maxMs: 20, jitter: 0 };
+  const always = () => ({ retry: true as const });
+  const transient = (msg: string) => Object.assign(new Error(msg), { transient: true });
+  const onlyTransient = (err: unknown) =>
+    (err as { transient?: boolean }).transient ? { retry: true as const } : { retry: false as const };
+
+  it('retries transient failures until delivery succeeds', async () => {
+    let calls = 0;
+    const q = createQueue(async () => {
+      if (++calls < 3) throw transient('offline');
+    }, silentLogger, { retryDecision: onlyTransient, backoff: fast });
+    q.push(m('a'));
+    await sleep(100);
+    await q.close(1000);
+    assert.equal(calls, 3);
+  });
+
+  it('gives up at once on a non-retryable error', async () => {
+    let calls = 0;
+    const q = createQueue(async () => {
+      calls++;
+      throw new Error('chat not found');
+    }, silentLogger, { retryDecision: onlyTransient, backoff: fast });
+    q.push(m('a'));
+    await q.close(1000);
+    assert.equal(calls, 1);
+  });
+
+  it('honors the wait time the error asks for (Telegram 429 retry_after)', async () => {
+    const times: number[] = [];
+    const q = createQueue(async () => {
+      times.push(Date.now());
+      if (times.length === 1) throw new Error('429');
+    }, silentLogger, { retryDecision: () => ({ retry: true, afterMs: 60 }), backoff: fast });
+    q.push(m('a'));
+    await sleep(150);
+    await q.close(1000);
+    assert.equal(times.length, 2);
+    const gap = times[1]! - times[0]!;
+    assert.ok(gap >= 55, `waited only ${gap} ms`);
+  });
+
+  it('gives up after retrying for maxRetryMs', async () => {
+    let calls = 0;
+    const q = createQueue(async () => {
+      calls++;
+      throw new Error('still offline');
+    }, silentLogger, { retryDecision: always, backoff: fast, maxRetryMs: 50 });
+    q.push(m('a'));
+    await sleep(150);
+    const before = calls;
+    await sleep(60);
+    assert.equal(calls, before, 'no attempts after giving up');
+    assert.ok(calls >= 2);
+    await q.close(1000);
+  });
+
+  it('keeps the order: later messages wait while one is being retried', async () => {
+    const got: string[] = [];
+    let failures = 2;
+    const q = createQueue(async (msg) => {
+      if (msg.id === 'a' && failures-- > 0) throw new Error('offline');
+      got.push(msg.id);
+    }, silentLogger, { retryDecision: always, backoff: fast });
+    q.push(m('a'));
+    q.push(m('b'));
+    await sleep(100);
+    await q.close(1000);
+    assert.deepEqual(got, ['a', 'b']);
+  });
+
+  it('close() cuts a long retry wait short', async () => {
+    const q = createQueue(async () => {
+      throw new Error('offline');
+    }, silentLogger, { retryDecision: always, backoff: { initialMs: 60_000, maxMs: 60_000 } });
+    q.push(m('a'));
+    await sleep(20); // first attempt failed, now waiting 60 s
+    const start = Date.now();
+    await q.close(5_000);
+    assert.ok(Date.now() - start < 1_000, 'close must not wait for the retry delay');
+  });
+
+  it('runs onSettled once per message, after success or after giving up', async () => {
+    const settled: string[] = [];
+    let calls = 0;
+    const q = createQueue(async (msg) => {
+      if (msg.id === 'retry-then-ok' && ++calls < 2) throw new Error('offline');
+      if (msg.id === 'hopeless') throw Object.assign(new Error('blocked'), { fatal: true });
+    }, silentLogger, {
+      retryDecision: (err) => ((err as { fatal?: boolean }).fatal ? { retry: false } : { retry: true }),
+      backoff: fast,
+      onSettled: (msg) => void settled.push(msg.id),
+    });
+    q.push(m('retry-then-ok'));
+    q.push(m('hopeless'));
+    q.push(Promise.resolve(undefined)); // nothing to settle
+    await sleep(100);
+    await q.close(1000);
+    assert.deepEqual(settled, ['retry-then-ok', 'hopeless']);
+  });
+});
+
 describe('queue: close', () => {
   it('waits for pending messages', async () => {
     let done = false;

@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { Api, GrammyError, HttpError, InputFile } from 'grammy';
+import type { RetryDecision } from '../core/queue.js';
 import type { RelayMessage } from '../core/types.js';
 import type { Logger } from '../logger.js';
 
@@ -46,6 +47,18 @@ export function toSafeError(err: unknown): TelegramError {
     return new TelegramError(err.message);
   }
   return new TelegramError(`unexpected ${err instanceof Error ? err.name : typeof err} from Telegram client`);
+}
+
+// Network trouble (no code), Telegram server errors (5xx) and rate limits (429) pass, so
+// they are retried; 429 waits exactly as long as Telegram asks. Other 4xx errors (chat not
+// found, bot blocked, bad request) will not fix themselves, so the message is given up.
+export function retryDecision(err: unknown): RetryDecision {
+  if (!(err instanceof TelegramError)) return { retry: false };
+  if (err.code === 429) {
+    return err.retryAfter !== undefined ? { retry: true, afterMs: err.retryAfter * 1000 } : { retry: true };
+  }
+  if (err.code === undefined || err.code >= 500) return { retry: true };
+  return { retry: false };
 }
 
 // Splits at a newline or space near the limit when possible, never inside an emoji

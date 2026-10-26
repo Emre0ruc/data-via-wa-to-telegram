@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { GrammyError, HttpError } from 'grammy';
-import { splitText, TelegramError, toSafeError } from '../src/telegram/sender.js';
+import { retryDecision, splitText, TelegramError, toSafeError } from '../src/telegram/sender.js';
 import { captureLogger } from './helpers.js';
 
 describe('splitText', () => {
@@ -29,6 +29,28 @@ describe('splitText', () => {
 
   it("uses Telegram's 4096 limit by default", () => {
     assert.deepEqual(splitText('x'.repeat(4096 * 2 + 5)).map((p) => p.length), [4096, 4096, 5]);
+  });
+});
+
+describe('retryDecision', () => {
+  it('retries network errors (no code) and Telegram server errors', () => {
+    assert.deepEqual(retryDecision(new TelegramError("Network request for 'sendMessage' failed!")), { retry: true });
+    assert.deepEqual(retryDecision(new TelegramError('sendMessage failed: 502 Bad Gateway', 502)), { retry: true });
+  });
+
+  it("waits exactly as long as a 429 asks", () => {
+    assert.deepEqual(retryDecision(new TelegramError('429', 429, 7)), { retry: true, afterMs: 7_000 });
+    assert.deepEqual(retryDecision(new TelegramError('429', 429)), { retry: true });
+  });
+
+  it('gives up on errors that will not fix themselves', () => {
+    for (const code of [400, 401, 403, 404]) {
+      assert.deepEqual(retryDecision(new TelegramError(`${code}`, code)), { retry: false }, `code ${code}`);
+    }
+  });
+
+  it('gives up on anything that is not a TelegramError (a bug, not an outage)', () => {
+    assert.deepEqual(retryDecision(new Error('boom')), { retry: false });
   });
 });
 

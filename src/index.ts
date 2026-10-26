@@ -3,7 +3,7 @@ import path from 'node:path';
 import { ConfigError, loadConfig } from './config.js';
 import { createQueue } from './core/queue.js';
 import { createLogger } from './logger.js';
-import { createTelegramSender, TelegramError } from './telegram/sender.js';
+import { createTelegramSender, retryDecision, TelegramError } from './telegram/sender.js';
 import { startWhatsApp } from './whatsapp/connection.js';
 import { selfChatMessages } from './whatsapp/filter.js';
 import { prepareMediaDir } from './whatsapp/media.js';
@@ -25,14 +25,13 @@ async function main(): Promise<void> {
   const mediaDir = path.join(config.dataDir, 'media');
   await prepareMediaDir(mediaDir);
 
-  const queue = createQueue(async (msg) => {
-    try {
-      await telegram.send(msg);
-    } finally {
-      // Temporary files go away whether or not the send worked (no retries before phase 4).
+  const queue = createQueue((msg) => telegram.send(msg), logger, {
+    retryDecision,
+    // The temporary file stays until the message is done for good: sent or given up.
+    onSettled: async (msg) => {
       if (msg.media) await rm(msg.media.path, { force: true });
-    }
-  }, logger);
+    },
+  });
 
   const whatsapp = await startWhatsApp({
     sessionDir: path.join(config.dataDir, 'session'),
