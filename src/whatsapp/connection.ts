@@ -6,6 +6,7 @@ import makeWASocket, {
   type WASocket,
 } from 'baileys';
 import QRCode from 'qrcode';
+import { backoffDelay } from '../core/backoff.js';
 import { createBaileysLogger, type Logger } from '../logger.js';
 
 export type MessagesUpsertHandler = (
@@ -23,8 +24,13 @@ export type WhatsAppConnection = {
   stop(): Promise<void>;
 };
 
-// Phase 2: fixed delay. Exponential backoff comes in phase 4.
-const RECONNECT_DELAY_MS = 5_000;
+// Reconnects back off from 5 s to at most 10 min, so a long outage doesn't turn into
+// hundreds of connection attempts against WhatsApp.
+const RECONNECT_BACKOFF = { initialMs: 5_000, maxMs: 10 * 60_000 };
+
+// Only a connection that stayed up this long resets the backoff. One that drops right
+// after opening keeps backing off instead of reconnecting every 5 s forever.
+const STABLE_CONNECTION_MS = 60_000;
 
 // Reconnecting after these would either never succeed (logged out) or fight
 // another instance that uses the same session (connection replaced).
@@ -32,6 +38,15 @@ const FATAL_DISCONNECTS = new Set<number>([
   DisconnectReason.loggedOut,
   DisconnectReason.connectionReplaced,
 ]);
+
+// undefined = do not reconnect. `attempt` counts reconnects since the last stable connection.
+export function reconnectDelay(code: number | undefined, attempt: number): number | undefined {
+  if (code !== undefined && FATAL_DISCONNECTS.has(code)) return undefined;
+  // 515 right after pairing is expected (WhatsApp asks for a fresh connection): reconnect at
+  // once, but only the first time, so a repeating 515 can't become a tight loop.
+  if (code === DisconnectReason.restartRequired && attempt === 0) return 0;
+  return backoffDelay(attempt, RECONNECT_BACKOFF);
+}
 
 // Baileys reports disconnect reasons as Boom errors: error.output.statusCode.
 function disconnectStatusCode(error: Error | undefined): number | undefined {
@@ -55,6 +70,8 @@ export async function startWhatsApp(options: WhatsAppOptions): Promise<WhatsAppC
   let sock: WASocket | undefined;
   let stopped = false;
   let reconnectTimer: NodeJS.Timeout | undefined;
+  let attempt = 0;
+  let openedAt: number | undefined;
 
   const connect = (): void => {
     const s = makeWASocket({
@@ -79,13 +96,18 @@ export async function startWhatsApp(options: WhatsAppOptions): Promise<WhatsAppC
       }
 
       if (connection === 'open') {
+        openedAt = Date.now();
         log.info('connected to WhatsApp');
         return;
       }
       if (connection !== 'close' || stopped) return;
 
+      if (openedAt !== undefined && Date.now() - openedAt >= STABLE_CONNECTION_MS) attempt = 0;
+      openedAt = undefined;
+
       const code = disconnectStatusCode(lastDisconnect?.error);
-      if (code !== undefined && FATAL_DISCONNECTS.has(code)) {
+      const delayMs = reconnectDelay(code, attempt);
+      if (delayMs === undefined) {
         log.error(
           { code },
           code === DisconnectReason.loggedOut
@@ -95,9 +117,8 @@ export async function startWhatsApp(options: WhatsAppOptions): Promise<WhatsAppC
         return;
       }
 
-      // 515 right after pairing is expected: WhatsApp asks for a fresh connection.
-      const delayMs = code === DisconnectReason.restartRequired ? 0 : RECONNECT_DELAY_MS;
-      log.warn({ code, delayMs }, 'connection closed, reconnecting');
+      attempt++;
+      log.warn({ code, attempt, delayMs }, 'connection closed, reconnecting');
       reconnectTimer = setTimeout(connect, delayMs);
     });
 
