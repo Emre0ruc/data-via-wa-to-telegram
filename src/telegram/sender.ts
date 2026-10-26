@@ -94,35 +94,50 @@ export async function createTelegramSender(options: TelegramSenderOptions): Prom
     }
   };
 
-  const sendImage = async (msg: RelayMessage, media: NonNullable<RelayMessage['media']>): Promise<void> => {
-    // A caption over the limit goes out as a separate text message right after the photo.
+  type Media = NonNullable<RelayMessage['media']>;
+
+  // Sends the file with `upload`, captioned when the text fits. A longer text goes out as a
+  // separate message right after the file.
+  const sendWithCaption = async (
+    msg: RelayMessage,
+    upload: (other: { caption?: string }) => Promise<void>,
+  ): Promise<void> => {
     const caption = msg.text && msg.text.length <= MAX_CAPTION_LENGTH ? msg.text : undefined;
-    const other = caption ? { caption } : {};
-    // An InputFile can be uploaded only once, so the fallback below builds a fresh one.
-    const file = () => new InputFile(media.path, path.basename(media.path));
-
-    let sentAsPhoto = false;
-    if (media.size <= MAX_PHOTO_BYTES) {
-      try {
-        await api.sendPhoto(chatId, file(), other);
-        sentAsPhoto = true;
-      } catch (err) {
-        // 400 = Telegram refused this as a photo (dimensions, format). Anything else is real.
-        if (!(err instanceof GrammyError && err.error_code === 400)) throw err;
-        log.warn({ id: msg.id, reason: err.description }, 'photo rejected, sending as document');
-      }
-    }
-    // Too big for sendPhoto (e.g. WhatsApp HD) or refused: a document keeps the original file.
-    if (!sentAsPhoto) await api.sendDocument(chatId, file(), other);
-
+    await upload(caption ? { caption } : {});
     if (msg.text && !caption) await sendText(msg.text);
   };
+
+  // An InputFile can be uploaded only once, so every attempt builds a fresh one.
+  // Documents keep their original name in Telegram; photos use the on-disk name.
+  const inputFile = (media: Media) => new InputFile(media.path, media.fileName ?? path.basename(media.path));
+
+  const sendDocument = (msg: RelayMessage, media: Media) =>
+    sendWithCaption(msg, async (other) => {
+      await api.sendDocument(chatId, inputFile(media), other);
+    });
+
+  const sendImage = (msg: RelayMessage, media: Media) =>
+    sendWithCaption(msg, async (other) => {
+      if (media.size <= MAX_PHOTO_BYTES) {
+        try {
+          await api.sendPhoto(chatId, inputFile(media), other);
+          return;
+        } catch (err) {
+          // 400 = Telegram refused this as a photo (dimensions, format). Anything else is real.
+          if (!(err instanceof GrammyError && err.error_code === 400)) throw err;
+          log.warn({ id: msg.id, reason: err.description }, 'photo rejected, sending as document');
+        }
+      }
+      // Too big for sendPhoto (e.g. WhatsApp HD) or refused: a document keeps the original file.
+      await api.sendDocument(chatId, inputFile(media), other);
+    });
 
   return {
     async send(msg) {
       try {
         if (msg.type === 'text' && msg.text) return await sendText(msg.text);
         if (msg.type === 'image' && msg.media) return await sendImage(msg, msg.media);
+        if (msg.type === 'document' && msg.media) return await sendDocument(msg, msg.media);
       } catch (err) {
         throw toSafeError(err);
       }
