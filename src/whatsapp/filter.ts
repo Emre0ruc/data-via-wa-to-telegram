@@ -1,11 +1,4 @@
-import {
-  getContentType,
-  jidNormalizedUser,
-  normalizeMessageContent,
-  type BaileysEventMap,
-  type Contact,
-  type WAMessage,
-} from 'baileys';
+import { jidNormalizedUser, type BaileysEventMap, type Contact, type WAMessage } from 'baileys';
 
 // Our own account can show up as a phone-number JID (...@s.whatsapp.net) or a LID (...@lid).
 // Both are normalized (device suffix like ":12" stripped) so they compare exactly.
@@ -36,14 +29,4 @@ export function selfChatMessages(
   const own = ownJids(user);
   if (own.size === 0) return [];
   return event.messages.filter((msg) => isSelfChatMessage(msg, own));
-}
-
-// Content type for logging (e.g. "conversation", "imageMessage"), never the content itself.
-export function messageType(msg: WAMessage): string {
-  return getContentType(normalizeMessageContent(msg.message)) ?? 'unknown';
-}
-
-export function extractText(msg: WAMessage): string | undefined {
-  const content = normalizeMessageContent(msg.message);
-  return content?.conversation || content?.extendedTextMessage?.text || undefined;
 }

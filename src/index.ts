@@ -2,7 +2,8 @@ import path from 'node:path';
 import { ConfigError, loadConfig } from './config.js';
 import { createLogger } from './logger.js';
 import { startWhatsApp } from './whatsapp/connection.js';
-import { extractText, messageType, selfChatMessages } from './whatsapp/filter.js';
+import { selfChatMessages } from './whatsapp/filter.js';
+import { messageType, normalize } from './whatsapp/normalize.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -14,10 +15,10 @@ async function main(): Promise<void> {
     onMessagesUpsert: (event, sock) => {
       // Anything that is not a live self-chat message is dropped here, unlogged.
       for (const msg of selfChatMessages(event, sock.user)) {
-        const text = extractText(msg);
+        const relay = normalize(msg);
         logger.info({ id: msg.key.id, type: messageType(msg) }, 'self-chat message');
-        // TEMPORARY (phase 2 acceptance test): prints the message body. Removed in phase 3.
-        if (text !== undefined) console.log(`[self-chat] ${text}`);
+        // TEMPORARY: prints the message body until the Telegram sender is wired in (phase 3).
+        if (relay) console.log(`[self-chat] ${relay.text}`);
       }
     },
   });
