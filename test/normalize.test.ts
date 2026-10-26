@@ -60,7 +60,7 @@ describe('extractText / messageType', () => {
 });
 
 describe('normalize: text', () => {
-  const opts = () => ({ mediaDir: dir, logger: silentLogger });
+  const opts = () => ({ mediaDir: dir, privatePrefix: '#gizli', logger: silentLogger });
 
   it('builds a text RelayMessage with a millisecond timestamp', async () => {
     assert.deepEqual(await normalize(wa('A1', { conversation: 'hey' }), opts()), {
@@ -99,7 +99,7 @@ describe('normalize: photos', () => {
     const download = fakeDownload(2 * MB);
     const r = await normalize(
       wa('P1', { imageMessage: { mimetype: 'image/jpeg', fileLength: 2 * MB, caption: 'beach' } }),
-      { mediaDir: dir, logger: silentLogger, download },
+      { mediaDir: dir, privatePrefix: '#gizli', logger: silentLogger, download },
     );
     assert.equal(r?.type, 'image');
     assert.equal(r?.text, 'beach');
@@ -111,7 +111,7 @@ describe('normalize: photos', () => {
   it('relays view-once photos like normal ones', async () => {
     const r = await normalize(
       wa('P2', wrapped('viewOnceMessageV2', { imageMessage: { mimetype: 'image/jpeg', viewOnce: true } })),
-      { mediaDir: dir, logger: silentLogger, download: fakeDownload(MB) },
+      { mediaDir: dir, privatePrefix: '#gizli', logger: silentLogger, download: fakeDownload(MB) },
     );
     assert.equal(r?.type, 'image');
     assert.equal(r?.text, undefined);
@@ -120,7 +120,7 @@ describe('normalize: photos', () => {
   it('never downloads a photo announced over the limit; sends a notice with the caption', async () => {
     const download = fakeDownload(60 * MB);
     const r = await normalize(wa('P3', { imageMessage: { fileLength: 60 * MB, caption: 'huge' } }), {
-      mediaDir: dir,
+      mediaDir: dir, privatePrefix: '#gizli',
       logger: silentLogger,
       download,
     });
@@ -135,7 +135,7 @@ describe('normalize: photos', () => {
 
   it('deletes a download that turns out to be over the limit', async () => {
     const r = await normalize(wa('P4', { imageMessage: {} }), {
-      mediaDir: dir,
+      mediaDir: dir, privatePrefix: '#gizli',
       logger: silentLogger,
       download: fakeDownload(51 * MB),
     });
@@ -149,7 +149,7 @@ describe('normalize: photos', () => {
       throw Object.assign(new Error('boom'), { name: 'TimeoutError', data: { caption: 'SECRET CAPTION' } });
     };
     const r = await normalize(wa('P5', { imageMessage: { caption: 'SECRET CAPTION' } }), {
-      mediaDir: dir,
+      mediaDir: dir, privatePrefix: '#gizli',
       logger,
       download: failing,
     });
@@ -164,7 +164,7 @@ describe('normalize: documents', () => {
   it('keeps the original file name for Telegram, names the file on disk after the ID', async () => {
     const r = await normalize(
       wa('D1', { documentMessage: { fileName: 'Fatura Ekim.pdf', mimetype: 'application/pdf', fileLength: 300_000 } }),
-      { mediaDir: dir, logger: silentLogger, download: fakeDownload(300_000) },
+      { mediaDir: dir, privatePrefix: '#gizli', logger: silentLogger, download: fakeDownload(300_000) },
     );
     assert.equal(r?.type, 'document');
     assert.deepEqual(r?.media, {
@@ -178,7 +178,7 @@ describe('normalize: documents', () => {
   it('uses the title when there is no file name, and the caption of a wrapped document', async () => {
     const r = await normalize(
       wa('D2', wrapped('documentWithCaptionMessage', { documentMessage: { title: 'notes', mimetype: 'text/plain', caption: 'read me' } })),
-      { mediaDir: dir, logger: silentLogger, download: fakeDownload(10) },
+      { mediaDir: dir, privatePrefix: '#gizli', logger: silentLogger, download: fakeDownload(10) },
     );
     assert.equal(r?.media?.fileName, 'notes');
     assert.equal(r?.text, 'read me');
@@ -186,7 +186,7 @@ describe('normalize: documents', () => {
 
   it('works without any name', async () => {
     const r = await normalize(wa('D3', { documentMessage: { mimetype: 'application/zip' } }), {
-      mediaDir: dir,
+      mediaDir: dir, privatePrefix: '#gizli',
       logger: silentLogger,
       download: fakeDownload(10),
     });
@@ -198,7 +198,7 @@ describe('normalize: documents', () => {
     const download = fakeDownload(700 * MB);
     const r = await normalize(
       wa('D4', { documentMessage: { fileName: 'big.iso', fileLength: 700 * MB, caption: 'c' } }),
-      { mediaDir: dir, logger: silentLogger, download },
+      { mediaDir: dir, privatePrefix: '#gizli', logger: silentLogger, download },
     );
     assert.equal(download.calls, 0);
     assert.equal(r?.text, '[Document not relayed: big.iso, 700.0 MB is over the 50.0 MB limit]\nc');
@@ -206,7 +206,7 @@ describe('normalize: documents', () => {
 
   it('keeps a photo sent "as document" a document (original quality)', async () => {
     const r = await normalize(wa('D5', { documentMessage: { fileName: 'photo.jpg', mimetype: 'image/jpeg' } }), {
-      mediaDir: dir,
+      mediaDir: dir, privatePrefix: '#gizli',
       logger: silentLogger,
       download: fakeDownload(5 * MB),
     });
@@ -245,5 +245,58 @@ describe('prepareMediaDir', () => {
     const media = path.join(dir, 'new', 'media');
     await prepareMediaDir(media);
     assert.ok(existsSync(media));
+  });
+});
+
+describe('normalize: private prefix', () => {
+  it('drops a private text and logs only id + type', async () => {
+    const { logger, output } = captureLogger();
+    const r = await normalize(wa('S1', { conversation: '  #Gizli şifrem 1234' }), {
+      mediaDir: dir,
+      privatePrefix: '#gizli',
+      logger,
+    });
+    assert.equal(r, undefined);
+    assert.match(output(), /private message not relayed/);
+    assert.match(output(), /S1/);
+    assert.doesNotMatch(output(), /şifrem|1234/);
+  });
+
+  it('drops a photo with a private caption without downloading it', async () => {
+    const download = fakeDownload(MB);
+    const r = await normalize(wa('S2', { imageMessage: { caption: '#gizli kimlik' } }), {
+      mediaDir: dir,
+      privatePrefix: '#gizli',
+      logger: silentLogger,
+      download,
+    });
+    assert.equal(r, undefined);
+    assert.equal(download.calls, 0);
+  });
+
+  it('drops a document with a private caption without downloading it', async () => {
+    const download = fakeDownload(MB);
+    const r = await normalize(
+      wa('S3', wrapped('documentWithCaptionMessage', { documentMessage: { fileName: 'pasaport.pdf', caption: '#GİZLİ' } })),
+      { mediaDir: dir, privatePrefix: '#gizli', logger: silentLogger, download },
+    );
+    assert.equal(r, undefined);
+    assert.equal(download.calls, 0);
+  });
+
+  it('sends no "too large" notice for an oversized private file (the notice would leak the caption)', async () => {
+    const r = await normalize(wa('S4', { documentMessage: { fileName: 'x.iso', fileLength: 900 * MB, caption: '#gizli' } }), {
+      mediaDir: dir,
+      privatePrefix: '#gizli',
+      logger: silentLogger,
+      download: fakeDownload(900 * MB),
+    });
+    assert.equal(r, undefined);
+  });
+
+  it('still relays media without a caption, and captions that only mention the prefix later', async () => {
+    const opts = { mediaDir: dir, privatePrefix: '#gizli', logger: silentLogger, download: fakeDownload(MB) };
+    assert.equal((await normalize(wa('S5', { imageMessage: {} }), opts))?.type, 'image');
+    assert.equal((await normalize(wa('S6', { imageMessage: { caption: 'not #gizli' } }), opts))?.type, 'image');
   });
 });

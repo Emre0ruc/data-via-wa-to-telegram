@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { BaileysEventMap, Contact, WAMessage } from 'baileys';
-import { ownJids, selfChatMessages } from '../src/whatsapp/filter.js';
+import { isPrivate, ownJids, selfChatMessages } from '../src/whatsapp/filter.js';
 
 const me: Contact = { id: '905551112233:12@s.whatsapp.net', lid: '123456789012345:12@lid' };
 
@@ -64,5 +64,50 @@ describe('selfChatMessages: drops', () => {
 
   it('a LID chat when our own LID is unknown', () => {
     assert.equal(passes(msg({ fromMe: true, remoteJid: '123456789012345@lid' }), 'notify', { id: me.id }), false);
+  });
+});
+
+describe('isPrivate', () => {
+  const P = '#gizli';
+
+  it('matches the prefix at the start', () => {
+    assert.ok(isPrivate('#gizli şifrem 1234', P));
+    assert.ok(isPrivate('#gizli', P));
+  });
+
+  it('ignores leading whitespace and invisible characters', () => {
+    assert.ok(isPrivate('   #gizli x', P));
+    assert.ok(isPrivate('\n\t#gizli x', P));
+    assert.ok(isPrivate('\u00A0#gizli x', P), 'no-break space');
+    assert.ok(isPrivate('\u200B#gizli x', P), 'zero-width space');
+    assert.ok(isPrivate('\uFEFF#gizli x', P), 'BOM');
+  });
+
+  it('is case-insensitive the Turkish way, including dotless/dotted I', () => {
+    for (const t of ['#Gizli x', '#GİZLİ x', '#GIZLI x', '#gızlı x', '#GiZlİ x']) {
+      assert.ok(isPrivate(t, P), t);
+    }
+  });
+
+  it('treats decomposed letters like composed ones', () => {
+    const decomposed = '#GI\u0307ZLI\u0307 x'; // I + combining dot above, instead of İ
+    assert.ok(isPrivate(decomposed, P));
+  });
+
+  it('also catches words that start with the prefix (errs on the side of not relaying)', () => {
+    assert.ok(isPrivate('#gizlilik ayarları', P));
+  });
+
+  it('does not match the prefix elsewhere in the text', () => {
+    assert.equal(isPrivate('bu #gizli değil', P), false);
+    assert.equal(isPrivate('gizli', P), false, 'no #');
+    assert.equal(isPrivate('# gizli', P), false, 'space inside the prefix');
+  });
+
+  it('handles empty input and odd prefixes', () => {
+    assert.equal(isPrivate(undefined, P), false);
+    assert.equal(isPrivate('', P), false);
+    assert.equal(isPrivate('anything', '   '), false, 'blank prefix matches nothing');
+    assert.ok(isPrivate('#GİZLİ x', ' #Gizli '), 'configured prefix is trimmed and folded too');
   });
 });
