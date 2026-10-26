@@ -1,7 +1,7 @@
 import { rm } from 'node:fs/promises';
 import path from 'node:path';
 import { getContentType, normalizeMessageContent, toNumber, type WAMessage } from 'baileys';
-import { MAX_MEDIA_BYTES, type RelayMessage } from '../core/types.js';
+import { MAX_MEDIA_BYTES, type RelayMessage, type RelayMessageType } from '../core/types.js';
 import type { Logger } from '../logger.js';
 import { downloadMedia, mediaFileName, type DownloadMedia } from './media.js';
 
@@ -36,6 +36,16 @@ function formatMb(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+type MediaInfo = {
+  type: Extract<RelayMessageType, 'image' | 'document'>;
+  label: string; // used in the "not relayed" notice
+  waType: string; // for logs
+  mimeType: string;
+  announcedSize: number; // 0 if WhatsApp did not say
+  caption?: string;
+  fileName?: string;
+};
+
 // Returns undefined for anything that is not relayed (unsupported type, failed download).
 // Never throws.
 export async function normalize(
@@ -55,37 +65,64 @@ export async function normalize(
   const text = extractText(msg);
   if (text !== undefined) return { id, timestamp, type: 'text', text };
 
-  const image = normalizeMessageContent(msg.message)?.imageMessage;
-  if (image) {
-    const caption = image.caption || undefined;
-    const tooLarge = (bytes: number): RelayMessage => ({
-      id,
-      timestamp,
-      type: 'text',
-      text: `[Photo not relayed: ${formatMb(bytes)} is over the ${formatMb(MAX_MEDIA_BYTES)} limit]`
-        + (caption ? `\n${caption}` : ''),
-    });
-
-    // Check the announced size first, so oversized files are never downloaded.
-    const announced = toNumber(image.fileLength);
-    if (announced > MAX_MEDIA_BYTES) return tooLarge(announced);
-
-    const mimeType = image.mimetype || 'image/jpeg';
-    const filePath = path.join(mediaDir, mediaFileName(id, mimeType));
-    let size: number;
-    try {
-      size = await download(msg, filePath);
-    } catch (err) {
-      log.error({ id, type: 'imageMessage', error: describeError(err) }, 'media download failed, message dropped');
-      return undefined;
-    }
-    if (size > MAX_MEDIA_BYTES) {
-      await rm(filePath, { force: true });
-      return tooLarge(size);
-    }
-    return { id, timestamp, type: 'image', text: caption, media: { path: filePath, mimeType, size } };
+  const content = normalizeMessageContent(msg.message);
+  let info: MediaInfo | undefined;
+  if (content?.imageMessage) {
+    const image = content.imageMessage;
+    info = {
+      type: 'image',
+      label: 'Photo',
+      waType: 'imageMessage',
+      mimeType: image.mimetype || 'image/jpeg',
+      announcedSize: toNumber(image.fileLength),
+      caption: image.caption || undefined,
+    };
+  } else if (content?.documentMessage) {
+    const doc = content.documentMessage;
+    info = {
+      type: 'document',
+      label: 'Document',
+      waType: 'documentMessage',
+      mimeType: doc.mimetype || 'application/octet-stream',
+      announcedSize: toNumber(doc.fileLength),
+      caption: doc.caption || undefined,
+      fileName: doc.fileName || doc.title || undefined,
+    };
+  }
+  if (!info) {
+    log.info({ id, type: messageType(msg) }, 'self-chat message not relayed (unsupported type)');
+    return undefined;
   }
 
-  log.info({ id, type: messageType(msg) }, 'self-chat message not relayed (unsupported type)');
-  return undefined;
+  const { caption, fileName, mimeType } = info;
+  const tooLarge = (bytes: number): RelayMessage => ({
+    id,
+    timestamp,
+    type: 'text',
+    text: `[${info.label} not relayed${fileName ? `: ${fileName}` : ''}, ${formatMb(bytes)} is over the ${formatMb(MAX_MEDIA_BYTES)} limit]`
+      + (caption ? `\n${caption}` : ''),
+  });
+
+  // Check the announced size first, so oversized files are never downloaded.
+  if (info.announcedSize > MAX_MEDIA_BYTES) return tooLarge(info.announcedSize);
+
+  const filePath = path.join(mediaDir, mediaFileName(id, mimeType, fileName));
+  let size: number;
+  try {
+    size = await download(msg, filePath);
+  } catch (err) {
+    log.error({ id, type: info.waType, error: describeError(err) }, 'media download failed, message dropped');
+    return undefined;
+  }
+  if (size > MAX_MEDIA_BYTES) {
+    await rm(filePath, { force: true });
+    return tooLarge(size);
+  }
+  return {
+    id,
+    timestamp,
+    type: info.type,
+    text: caption,
+    media: { path: filePath, mimeType, size, ...(fileName ? { fileName } : {}) },
+  };
 }

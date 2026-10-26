@@ -11,11 +11,17 @@ const EXTENSIONS: Record<string, string> = {
   'image/png': 'png',
   'image/webp': 'webp',
   'image/gif': 'gif',
+  'application/pdf': 'pdf',
 };
 
-export function mediaFileName(id: string, mimeType: string): string {
+// The file on disk is always named after the message ID (never the sender-supplied name,
+// which could contain path separators). The extension comes from the original name if it
+// has a sane one, otherwise from the MIME type.
+export function mediaFileName(id: string, mimeType: string, originalName?: string): string {
   const safeId = id.replace(/[^A-Za-z0-9_-]/g, '_');
-  return `${safeId}.${EXTENSIONS[mimeType] ?? 'bin'}`;
+  const fromName = originalName ? path.extname(originalName).slice(1).toLowerCase() : '';
+  const ext = /^[a-z0-9]{1,10}$/.test(fromName) ? fromName : (EXTENSIONS[mimeType] ?? 'bin');
+  return `${safeId}.${ext}`;
 }
 
 // Creates the media folder and removes leftovers from a previous run. Only plain files
