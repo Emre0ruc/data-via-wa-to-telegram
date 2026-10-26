@@ -33,7 +33,7 @@ export class TelegramError extends Error {
   }
 }
 
-function toSafeError(err: unknown): TelegramError {
+export function toSafeError(err: unknown): TelegramError {
   if (err instanceof GrammyError) {
     return new TelegramError(
       `${err.method} failed: ${err.error_code} ${err.description}`,
