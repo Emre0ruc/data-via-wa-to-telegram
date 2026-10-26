@@ -1,13 +1,26 @@
 import path from 'node:path';
 import { ConfigError, loadConfig } from './config.js';
+import { createQueue } from './core/queue.js';
 import { createLogger } from './logger.js';
+import { createTelegramSender, TelegramError } from './telegram/sender.js';
 import { startWhatsApp } from './whatsapp/connection.js';
 import { selfChatMessages } from './whatsapp/filter.js';
 import { messageType, normalize } from './whatsapp/normalize.js';
 
+// How long shutdown waits for queued messages to reach Telegram.
+const SHUTDOWN_TIMEOUT_MS = 10_000;
+
 async function main(): Promise<void> {
   const config = loadConfig();
   const logger = createLogger(config.logLevel);
+
+  // Telegram first: a bad token or chat ID stops us before we connect to WhatsApp.
+  const telegram = await createTelegramSender({
+    token: config.telegramBotToken,
+    chatId: config.telegramChatId,
+    logger,
+  });
+  const queue = createQueue((msg) => telegram.send(msg), logger);
 
   const whatsapp = await startWhatsApp({
     sessionDir: path.join(config.dataDir, 'session'),
@@ -16,9 +29,11 @@ async function main(): Promise<void> {
       // Anything that is not a live self-chat message is dropped here, unlogged.
       for (const msg of selfChatMessages(event, sock.user)) {
         const relay = normalize(msg);
-        logger.info({ id: msg.key.id, type: messageType(msg) }, 'self-chat message');
-        // TEMPORARY: prints the message body until the Telegram sender is wired in (phase 3).
-        if (relay) console.log(`[self-chat] ${relay.text}`);
+        if (relay) {
+          queue.push(relay);
+        } else {
+          logger.info({ id: msg.key.id, type: messageType(msg) }, 'self-chat message not relayed (unsupported type)');
+        }
       }
     },
   });
@@ -28,18 +43,29 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info({ signal }, 'shutting down');
+    // WhatsApp first so no new messages arrive, then let the queue drain.
     whatsapp
       .stop()
-      .catch((err: unknown) => logger.error({ err }, 'error during shutdown'))
+      .catch((err: unknown) => logger.error({ err }, 'error while closing WhatsApp'))
+      .then(() => queue.close(SHUTDOWN_TIMEOUT_MS))
       .finally(() => process.exit(0));
   };
   process.once('SIGINT', shutdown);
   process.once('SIGTERM', shutdown);
 }
 
+const TELEGRAM_HINTS: Record<number, string> = {
+  401: 'Check TELEGRAM_BOT_TOKEN.',
+  400: 'Check TELEGRAM_CHAT_ID (npm run chat-id) and that you sent /start to the bot.',
+  403: 'The bot is blocked in that chat. Unblock it and send /start.',
+};
+
 main().catch((err: unknown) => {
   if (err instanceof ConfigError) {
     console.error(err.message);
+  } else if (err instanceof TelegramError) {
+    const hint = err.code !== undefined ? TELEGRAM_HINTS[err.code] : undefined;
+    console.error(`Telegram check failed: ${err.message}${hint ? `\n${hint}` : ''}`);
   } else {
     console.error(err);
   }

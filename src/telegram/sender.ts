@@ -76,6 +76,9 @@ export async function createTelegramSender(options: TelegramSenderOptions): Prom
 
   try {
     const me = await api.getMe();
+    // Fails at startup (instead of on the first relayed message) if TELEGRAM_CHAT_ID is
+    // wrong or the bot was never /start-ed in that chat. Read-only: sends nothing.
+    await api.getChat(chatId);
     log.info({ bot: me.username }, 'telegram bot ready');
   } catch (err) {
     throw toSafeError(err);
