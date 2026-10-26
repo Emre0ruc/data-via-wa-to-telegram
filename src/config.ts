@@ -8,12 +8,14 @@ const LOG_LEVELS = ['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'
 const optional = <T extends z.ZodType>(schema: T) =>
   z.preprocess((v) => (typeof v === 'string' && v.trim() === '' ? undefined : v), schema);
 
+const botToken = optional(
+  z
+    .string({ error: 'missing' })
+    .regex(/^\d+:[A-Za-z0-9_-]+$/, 'does not look like a bot token (expected 123456:ABC-...)'),
+);
+
 const envSchema = z.object({
-  TELEGRAM_BOT_TOKEN: optional(
-    z
-      .string({ error: 'missing' })
-      .regex(/^\d+:[A-Za-z0-9_-]+$/, 'does not look like a bot token (expected 123456:ABC-...)'),
-  ),
+  TELEGRAM_BOT_TOKEN: botToken,
   TELEGRAM_CHAT_ID: optional(
     z
       .string({ error: 'missing' })
@@ -47,10 +49,10 @@ function loadDotEnv(): void {
   }
 }
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+function parseEnv<T extends z.ZodType>(schema: T, env: NodeJS.ProcessEnv): z.output<T> {
   if (env === process.env) loadDotEnv();
 
-  const result = envSchema.safeParse(env);
+  const result = schema.safeParse(env);
   if (!result.success) {
     // Only report variable names and reasons, never the values (they may be secrets).
     const lines = result.error.issues.map((i) => `  - ${i.path.join('.') || '(root)'}: ${i.message}`);
@@ -58,8 +60,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       `Invalid configuration:\n${lines.join('\n')}\nSee .env.example for the expected variables.`,
     );
   }
+  return result.data;
+}
 
-  const e = result.data;
+// For the chat-id helper, which runs before TELEGRAM_CHAT_ID is known.
+export function loadBotToken(env: NodeJS.ProcessEnv = process.env): string {
+  return parseEnv(z.object({ TELEGRAM_BOT_TOKEN: botToken }), env).TELEGRAM_BOT_TOKEN;
+}
+
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  const e = parseEnv(envSchema, env);
   return {
     telegramBotToken: e.TELEGRAM_BOT_TOKEN,
     telegramChatId: e.TELEGRAM_CHAT_ID,
