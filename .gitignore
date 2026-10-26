@@ -1,3 +1,10 @@
+# Project runtime data: WhatsApp session, SQLite database, temporary media
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
 # Logs
 logs
 *.log

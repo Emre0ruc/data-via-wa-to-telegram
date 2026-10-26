@@ -1,0 +1,159 @@
+import { mkdir } from 'node:fs/promises';
+import makeWASocket, {
+  DisconnectReason,
+  useMultiFileAuthState,
+  type BaileysEventMap,
+  type WASocket,
+} from 'baileys';
+import QRCode from 'qrcode';
+import { backoffDelay } from '../core/backoff.js';
+import { createBaileysLogger, type Logger } from '../logger.js';
+
+export type MessagesUpsertHandler = (
+  event: BaileysEventMap['messages.upsert'],
+  sock: WASocket,
+) => void;
+
+export type FatalReason = 'loggedOut' | 'connectionReplaced';
+
+export type WhatsAppOptions = {
+  sessionDir: string;
+  logger: Logger;
+  onMessagesUpsert?: MessagesUpsertHandler;
+  // Lifecycle hooks (e.g. to show the QR in Telegram). They must not throw.
+  onQr?: (qr: string) => void;
+  onOpen?: () => void;
+  onFatal?: (reason: FatalReason) => void;
+};
+
+export type WhatsAppConnection = {
+  stop(): Promise<void>;
+};
+
+// Reconnects back off from 5 s to at most 10 min, so a long outage doesn't turn into
+// hundreds of connection attempts against WhatsApp.
+const RECONNECT_BACKOFF = { initialMs: 5_000, maxMs: 10 * 60_000 };
+
+// Only a connection that stayed up this long resets the backoff. One that drops right
+// after opening keeps backing off instead of reconnecting every 5 s forever.
+const STABLE_CONNECTION_MS = 60_000;
+
+// Reconnecting after these would either never succeed (logged out) or fight
+// another instance that uses the same session (connection replaced).
+const FATAL_DISCONNECTS = new Set<number>([
+  DisconnectReason.loggedOut,
+  DisconnectReason.connectionReplaced,
+]);
+
+// undefined = do not reconnect. `attempt` counts reconnects since the last stable connection.
+export function reconnectDelay(code: number | undefined, attempt: number): number | undefined {
+  if (code !== undefined && FATAL_DISCONNECTS.has(code)) return undefined;
+  // 515 right after pairing is expected (WhatsApp asks for a fresh connection): reconnect at
+  // once, but only the first time, so a repeating 515 can't become a tight loop.
+  if (code === DisconnectReason.restartRequired && attempt === 0) return 0;
+  return backoffDelay(attempt, RECONNECT_BACKOFF);
+}
+
+// Baileys reports disconnect reasons as Boom errors: error.output.statusCode.
+function disconnectStatusCode(error: Error | undefined): number | undefined {
+  return (error as { output?: { statusCode?: number } } | undefined)?.output?.statusCode;
+}
+
+async function printQr(qr: string): Promise<void> {
+  // Written straight to stdout, not to the logger: the QR payload is pairing material.
+  process.stdout.write(await QRCode.toString(qr, { type: 'terminal', small: true }));
+}
+
+export async function startWhatsApp(options: WhatsAppOptions): Promise<WhatsAppConnection> {
+  const { sessionDir, logger, onMessagesUpsert, onQr, onOpen, onFatal } = options;
+  const log = logger.child({ module: 'whatsapp' });
+  const baileysLogger = createBaileysLogger(logger);
+
+  // The session files grant full access to the account: owner-only permissions.
+  await mkdir(sessionDir, { recursive: true, mode: 0o700 });
+  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+
+  let sock: WASocket | undefined;
+  let stopped = false;
+  let reconnectTimer: NodeJS.Timeout | undefined;
+  let attempt = 0;
+  let openedAt: number | undefined;
+
+  const connect = (): void => {
+    const s = makeWASocket({
+      auth: state,
+      logger: baileysLogger,
+      // Read-only: never show as online, never request the full chat history.
+      // The default recent/bootstrap sync stays on: Baileys needs it for LID mappings,
+      // and those history messages arrive via 'messaging-history.set', which we ignore.
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
+    });
+    sock = s;
+
+    s.ev.on('creds.update', () => {
+      saveCreds().catch((err: unknown) => log.error({ err }, 'failed to save credentials'));
+    });
+
+    s.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+      if (qr) {
+        log.info('new pairing QR code: scan it with WhatsApp > Linked devices > Link a device');
+        // Only in a real terminal; under Docker the logs would just fill up with QR blocks.
+        if (process.stdout.isTTY) {
+          printQr(qr).catch((err: unknown) => log.error({ err }, 'failed to render QR code'));
+        }
+        onQr?.(qr);
+      }
+
+      if (connection === 'open') {
+        openedAt = Date.now();
+        log.info('connected to WhatsApp');
+        onOpen?.();
+        return;
+      }
+      if (connection !== 'close' || stopped) return;
+
+      if (openedAt !== undefined && Date.now() - openedAt >= STABLE_CONNECTION_MS) attempt = 0;
+      openedAt = undefined;
+
+      const code = disconnectStatusCode(lastDisconnect?.error);
+      const delayMs = reconnectDelay(code, attempt);
+      if (delayMs === undefined) {
+        const reason: FatalReason = code === DisconnectReason.loggedOut ? 'loggedOut' : 'connectionReplaced';
+        log.error(
+          { code },
+          reason === 'loggedOut'
+            ? 'session logged out; delete the session folder and restart to pair again'
+            : 'session opened elsewhere (another instance running?); not reconnecting',
+        );
+        onFatal?.(reason);
+        return;
+      }
+
+      attempt++;
+      log.warn({ code, attempt, delayMs }, 'connection closed, reconnecting');
+      reconnectTimer = setTimeout(connect, delayMs);
+    });
+
+    if (onMessagesUpsert) {
+      s.ev.on('messages.upsert', (event) => {
+        try {
+          onMessagesUpsert(event, s);
+        } catch (err) {
+          log.error({ err }, 'messages.upsert handler failed');
+        }
+      });
+    }
+  };
+
+  connect();
+
+  return {
+    async stop() {
+      stopped = true;
+      clearTimeout(reconnectTimer);
+      // end() closes the socket but keeps the session. Never call logout(): it unlinks the device.
+      await sock?.end(undefined);
+    },
+  };
+}
