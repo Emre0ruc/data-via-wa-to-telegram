@@ -1,20 +1,36 @@
+import path from 'node:path';
 import { ConfigError, loadConfig } from './config.js';
+import { createLogger } from './logger.js';
+import { startWhatsApp } from './whatsapp/connection.js';
 
-function main(): void {
+async function main(): Promise<void> {
   const config = loadConfig();
-  // Phase 1: only prove the config loads. Never print the token.
-  console.log(
-    `Config OK: chatId=${config.telegramChatId} dataDir=${config.dataDir} ` +
-      `logLevel=${config.logLevel} privatePrefix=${config.privatePrefix}`,
-  );
+  const logger = createLogger(config.logLevel);
+
+  const whatsapp = await startWhatsApp({
+    sessionDir: path.join(config.dataDir, 'session'),
+    logger,
+  });
+
+  let shuttingDown = false;
+  const shutdown = (signal: NodeJS.Signals): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.info({ signal }, 'shutting down');
+    whatsapp
+      .stop()
+      .catch((err: unknown) => logger.error({ err }, 'error during shutdown'))
+      .finally(() => process.exit(0));
+  };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
 }
 
-try {
-  main();
-} catch (err) {
+main().catch((err: unknown) => {
   if (err instanceof ConfigError) {
     console.error(err.message);
-    process.exit(1);
+  } else {
+    console.error(err);
   }
-  throw err;
-}
+  process.exit(1);
+});
