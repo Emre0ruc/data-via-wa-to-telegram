@@ -1,9 +1,12 @@
-import { Api, GrammyError, HttpError } from 'grammy';
+import path from 'node:path';
+import { Api, GrammyError, HttpError, InputFile } from 'grammy';
 import type { RelayMessage } from '../core/types.js';
 import type { Logger } from '../logger.js';
 
-// Telegram's limit for a single text message.
+// Telegram's limits for a text message, a media caption, and sendPhoto uploads.
 export const MAX_MESSAGE_LENGTH = 4096;
+export const MAX_CAPTION_LENGTH = 1024;
+export const MAX_PHOTO_BYTES = 10 * 1024 * 1024;
 
 export type TelegramSenderOptions = {
   token: string;
@@ -84,19 +87,46 @@ export async function createTelegramSender(options: TelegramSenderOptions): Prom
     throw toSafeError(err);
   }
 
+  // Plain text, no parse_mode: characters like * or _ are sent as-is and cannot break formatting.
+  const sendText = async (text: string): Promise<void> => {
+    for (const part of splitText(text)) {
+      await api.sendMessage(chatId, part);
+    }
+  };
+
+  const sendImage = async (msg: RelayMessage, media: NonNullable<RelayMessage['media']>): Promise<void> => {
+    // A caption over the limit goes out as a separate text message right after the photo.
+    const caption = msg.text && msg.text.length <= MAX_CAPTION_LENGTH ? msg.text : undefined;
+    const other = caption ? { caption } : {};
+    // An InputFile can be uploaded only once, so the fallback below builds a fresh one.
+    const file = () => new InputFile(media.path, path.basename(media.path));
+
+    let sentAsPhoto = false;
+    if (media.size <= MAX_PHOTO_BYTES) {
+      try {
+        await api.sendPhoto(chatId, file(), other);
+        sentAsPhoto = true;
+      } catch (err) {
+        // 400 = Telegram refused this as a photo (dimensions, format). Anything else is real.
+        if (!(err instanceof GrammyError && err.error_code === 400)) throw err;
+        log.warn({ id: msg.id, reason: err.description }, 'photo rejected, sending as document');
+      }
+    }
+    // Too big for sendPhoto (e.g. WhatsApp HD) or refused: a document keeps the original file.
+    if (!sentAsPhoto) await api.sendDocument(chatId, file(), other);
+
+    if (msg.text && !caption) await sendText(msg.text);
+  };
+
   return {
     async send(msg) {
-      if (msg.type !== 'text' || !msg.text) {
-        throw new TelegramError(`unsupported message type: ${msg.type}`);
+      try {
+        if (msg.type === 'text' && msg.text) return await sendText(msg.text);
+        if (msg.type === 'image' && msg.media) return await sendImage(msg, msg.media);
+      } catch (err) {
+        throw toSafeError(err);
       }
-      // Plain text, no parse_mode: characters like * or _ are sent as-is and cannot break formatting.
-      for (const part of splitText(msg.text)) {
-        try {
-          await api.sendMessage(chatId, part);
-        } catch (err) {
-          throw toSafeError(err);
-        }
-      }
+      throw new TelegramError(`unsupported message type: ${msg.type}`);
     },
   };
 }
